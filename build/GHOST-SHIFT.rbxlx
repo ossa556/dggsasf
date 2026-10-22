@@ -1,0 +1,1697 @@
+<roblox version="4">
+  <Item class="ReplicatedStorage" referent="0">
+    <Properties>
+      <string name="Name">ReplicatedStorage</string>
+    </Properties>
+    <Item class="Folder" referent="1">
+      <Properties>
+        <string name="Name">GhostShift</string>
+      </Properties>
+      <Item class="ModuleScript" referent="2">
+        <Properties>
+          <string name="Name">Config</string>
+          <string name="Source"><![CDATA[--!strict
+-- Public gameplay tuning only. The server remains authoritative.
+return table.freeze({
+    MinPlayers = 2,
+    IntermissionSeconds = 15,
+    HideSeconds = 20,
+    HuntSeconds = 150,
+    ResultsSeconds = 10,
+    CaptureReward = 15,
+    WinReward = 40,
+    GhostSpeed = 16,
+    HunterSpeed = 16,
+    SprintSpeed = 28,
+    SprintSeconds = 3,
+    SprintCooldown = 12,
+    DisguiseDistance = 10,
+    DetectorRange = 90,
+    Weapons = table.freeze({
+        Pulse = table.freeze({
+            Magazine = 6,
+            FireInterval = 0.65,
+            ReloadSeconds = 2.5,
+            Range = 130,
+        }),
+    }),
+})
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="3">
+        <Properties>
+          <string name="Name">RoundRules</string>
+          <string name="Source"><![CDATA[-- Pure round decisions. The server owns the inputs and applies every result.
+local RoundRules = {}
+
+function RoundRules.chooseGhostCount(playerCount: number): number
+	if playerCount < 2 then
+		return 0
+	end
+	return math.clamp(math.floor(playerCount / 2), 1, playerCount - 1)
+end
+
+function RoundRules.getWinner(ghostsAlive: number, huntersAlive: number, timeExpired: boolean): string?
+	if ghostsAlive <= 0 and huntersAlive <= 0 then
+		return "Draw"
+	elseif ghostsAlive <= 0 then
+		return "Hunters"
+	elseif huntersAlive <= 0 or timeExpired then
+		return "Ghosts"
+	end
+	return nil
+end
+
+return RoundRules
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="ServerScriptService" referent="4">
+    <Properties>
+      <string name="Name">ServerScriptService</string>
+    </Properties>
+    <Item class="Folder" referent="5">
+      <Properties>
+        <string name="Name">GhostShift</string>
+      </Properties>
+      <Item class="ModuleScript" referent="6">
+        <Properties>
+          <string name="Name">GameplayService</string>
+          <string name="Source"><![CDATA[-- Server-owned disguise, pulse weapon, reload and ghost sprint.
+-- Clients send intentions only. No client supplies a hit, origin, ammo or reward.
+local Players = game:GetService("Players")
+
+local GameplayService = {}
+
+local function now()
+	return workspace:GetServerTimeNow()
+end
+
+local function finiteVector(value)
+	return typeof(value) == "Vector3"
+		and value.X == value.X and value.Y == value.Y and value.Z == value.Z
+		and math.abs(value.X) < 1e6 and math.abs(value.Y) < 1e6 and math.abs(value.Z) < 1e6
+end
+
+function GameplayService.Start(ctx)
+	local controls = {}
+	local function controlFor(player)
+		if not controls[player] then
+			controls[player] = { Epoch = 0, ReloadToken = 0, Requests = {}, Hidden = {}, SprintUntil = 0 }
+		end
+		return controls[player]
+	end
+
+	local function gate(player, action, interval)
+		if not ctx.PlayerState[player] then return false end
+		local control = controlFor(player)
+		local timestamp = now()
+		if timestamp - (control.Requests[action] or -math.huge) < interval then
+			return false
+		end
+		control.Requests[action] = timestamp
+		return true
+	end
+
+	local function livingCharacter(player)
+		local character = player.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		if humanoid and humanoid.Health > 0 and root and root:IsA("BasePart") then
+			return character, humanoid, root
+		end
+		return nil, nil, nil
+	end
+
+	local function eligibleGhost(player)
+		local state = ctx.PlayerState[player]
+		return state and state.Role == "Ghost" and state.Alive
+			and (ctx.Round.Phase == "Hide" or ctx.Round.Phase == "Hunt")
+	end
+
+	local function eligibleHunter(player)
+		local state = ctx.PlayerState[player]
+		return state and state.Role == "Hunter" and state.Alive and ctx.Round.Phase == "Hunt"
+	end
+
+	local function removeDisguise(player)
+		local control = controls[player]
+		local state = ctx.PlayerState[player]
+		if state and state.Disguise then
+			state.Disguise:Destroy()
+			state.Disguise = nil
+		end
+		if control then
+			for instance, transparency in control.Hidden do
+				if instance.Parent then
+					instance.Transparency = transparency
+				end
+			end
+			control.Hidden = {}
+		end
+	end
+
+	local function hidePart(player, instance)
+		local state = ctx.PlayerState[player]
+		if not state or not state.Disguise or instance == state.Disguise or instance:IsDescendantOf(state.Disguise) then
+			return
+		end
+		if instance:IsA("BasePart") or instance:IsA("Decal") then
+			local hidden = controlFor(player).Hidden
+			if hidden[instance] == nil then
+				hidden[instance] = instance.Transparency
+			end
+			instance.Transparency = 1
+		end
+	end
+
+	local function restoreSpeed(player)
+		local state = ctx.PlayerState[player]
+		local _, humanoid = livingCharacter(player)
+		if state and humanoid then
+			humanoid.WalkSpeed = if state.Role == "Ghost" then ctx.Config.GhostSpeed else ctx.Config.HunterSpeed
+		end
+	end
+
+	ctx.ResetPlayer = function(player)
+		local control = controlFor(player)
+		control.Epoch += 1
+		control.ReloadToken += 1
+		control.SprintUntil = 0
+		removeDisguise(player)
+		local state = ctx.PlayerState[player]
+		if state then
+			state.Ammo = ctx.Config.Weapons.Pulse.Magazine
+			state.ReloadUntil = 0
+			state.LastFire = 0
+			state.AbilityReadyAt = 0
+		end
+		restoreSpeed(player)
+	end
+
+	ctx.PrepareCharacter = function(player, character)
+		if not ctx.PlayerState[player] then
+			return
+		end
+		local control = controlFor(player)
+		if control.DeathConnection then control.DeathConnection:Disconnect() end
+		if control.DescendantConnection then control.DescendantConnection:Disconnect() end
+		ctx.ResetPlayer(player)
+		local humanoid = character:WaitForChild("Humanoid", 5)
+		if player.Character ~= character or not ctx.PlayerState[player] or not humanoid or not humanoid:IsA("Humanoid") then
+			return
+		end
+		humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+		restoreSpeed(player)
+		control.DescendantConnection = character.DescendantAdded:Connect(function(instance)
+			hidePart(player, instance)
+		end)
+		control.DeathConnection = humanoid.Died:Connect(function()
+			if player.Character ~= character or not ctx.PlayerState[player] then return end
+			ctx.ResetPlayer(player)
+			if ctx.Eliminate then
+				ctx.Eliminate(player)
+			else
+				ctx.PlayerState[player].Alive = false
+				ctx.Broadcast()
+			end
+		end)
+	end
+
+	ctx.CleanupPlayer = function(player)
+		local control = controls[player]
+		if control then
+			ctx.ResetPlayer(player)
+			if control.DeathConnection then control.DeathConnection:Disconnect() end
+			if control.DescendantConnection then control.DescendantConnection:Disconnect() end
+			controls[player] = nil
+		end
+	end
+
+	local function disguise(player, prop)
+		if not gate(player, "Disguise", 0.7) or not eligibleGhost(player) then return end
+		if not prop:IsDescendantOf(ctx.Props) or prop:GetAttribute("GhostShiftProp") ~= true then return end
+		local character, humanoid, root = livingCharacter(player)
+		if not character or (root.Position - prop.Position).Magnitude > ctx.Config.DisguiseDistance then return end
+		local head = character:FindFirstChild("Head")
+		local origin = if head and head:IsA("BasePart") then head.Position else root.Position
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = { character }
+		local obstruction = workspace:Raycast(origin, prop.Position - origin, params)
+		if obstruction and obstruction.Instance ~= prop then return end
+		removeDisguise(player)
+		local visual = prop:Clone()
+		visual.Name = "GhostDisguise"
+		visual:SetAttribute("GhostShiftOwnerUserId", player.UserId)
+		for _, descendant in visual:GetDescendants() do
+			if descendant:IsA("ProximityPrompt") or descendant:IsA("BaseScript") or descendant:IsA("ModuleScript") then
+				descendant:Destroy()
+			end
+		end
+		-- A cylinder's local Y size is not its world-space height after rotation.
+		local rotation = prop.CFrame.Rotation
+		local height = math.abs(rotation.RightVector.Y) * visual.Size.X
+			+ math.abs(rotation.UpVector.Y) * visual.Size.Y
+			+ math.abs(rotation.LookVector.Y) * visual.Size.Z
+		local rootToFloor = humanoid.HipHeight + root.Size.Y / 2
+		if humanoid.RigType == Enum.HumanoidRigType.R6 then
+			-- R6 HipHeight omits the leg, unlike the R15 standing-height formula.
+			local leg = character:FindFirstChild("Left Leg") or character:FindFirstChild("Right Leg")
+			rootToFloor += if leg and leg:IsA("BasePart") then leg.Size.Y else 2
+		end
+		local offset = -rootToFloor + height / 2
+		visual.CFrame = root.CFrame * CFrame.new(0, offset, 0) * prop.CFrame.Rotation
+		visual.Anchored = false
+		visual.CanCollide = false
+		visual.CanTouch = false
+		visual.CanQuery = true
+		visual.Massless = true
+		local state = ctx.PlayerState[player]
+		state.Disguise = visual
+		visual.Parent = character
+		for _, descendant in character:GetDescendants() do
+			hidePart(player, descendant)
+		end
+		local weld = Instance.new("WeldConstraint")
+		weld.Part0 = root
+		weld.Part1 = visual
+		weld.Parent = visual
+		ctx.Broadcast()
+	end
+
+	local connectedProps = setmetatable({}, { __mode = "k" })
+	local function connectProp(prop)
+		if not prop:IsA("BasePart") or prop:GetAttribute("GhostShiftProp") ~= true or connectedProps[prop] then return end
+		connectedProps[prop] = true
+		local prompt = prop:FindFirstChildOfClass("ProximityPrompt")
+		if not prompt then
+			prompt = Instance.new("ProximityPrompt")
+			prompt.Name = "GhostDisguisePrompt"
+			prompt.ActionText = "Possess"
+			prompt.ObjectText = prop.Name
+			prompt.KeyboardKeyCode = Enum.KeyCode.E
+			prompt.HoldDuration = 0.25
+			prompt.MaxActivationDistance = 8
+			prompt.RequiresLineOfSight = true
+			prompt.Parent = prop
+		end
+		prompt.Triggered:Connect(function(player) disguise(player, prop) end)
+	end
+	for _, prop in ctx.Props:GetDescendants() do connectProp(prop) end
+	ctx.Props.DescendantAdded:Connect(connectProp)
+
+	ctx.Remotes.ToggleDisguise.OnServerEvent:Connect(function(player)
+		local state = ctx.PlayerState[player]
+		if not state or state.Role ~= "Ghost" or not state.Disguise or not gate(player, "ToggleDisguise", 0.4) then return end
+		removeDisguise(player)
+		ctx.Broadcast()
+	end)
+
+	ctx.Remotes.Fire.OnServerEvent:Connect(function(player, direction)
+		if not gate(player, "FireRequest", 0.04) or not eligibleHunter(player) or not finiteVector(direction) then return end
+		local magnitude = direction.Magnitude
+		if magnitude < 0.01 or magnitude > 1e4 then return end
+		local state = ctx.PlayerState[player]
+		local weapon = ctx.Config.Weapons.Pulse
+		local timestamp = now()
+		if timestamp - state.LastFire < weapon.FireInterval or state.ReloadUntil > timestamp or state.Ammo <= 0 then return end
+		local character, _, root = livingCharacter(player)
+		if not character then return end
+		local head = character:FindFirstChild("Head")
+		local origin = if head and head:IsA("BasePart") then head.Position else root.Position
+		local ignored = { character }
+		-- Query only the visible disguise, never the invisible humanoid silhouette.
+		for ghost, ghostState in ctx.PlayerState do
+			if ghostState.Disguise and controls[ghost] then
+				for hidden in controls[ghost].Hidden do
+					if hidden:IsA("BasePart") and hidden.Parent then table.insert(ignored, hidden) end
+				end
+			end
+		end
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = ignored
+		local ray = direction.Unit * weapon.Range
+		local result = workspace:Raycast(origin, ray, params)
+		local position = if result then result.Position else origin + ray
+		state.LastFire = timestamp
+		state.Ammo -= 1
+		ctx.Remotes.Effects:FireAllClients({ kind = "Shot", origin = origin, position = position, playerId = player.UserId })
+		if result and ctx.CaptureGhost then
+			local ancestor = result.Instance
+			local target
+			while ancestor and ancestor ~= workspace do
+				if ancestor:IsA("Model") then
+					target = Players:GetPlayerFromCharacter(ancestor)
+					if target then break end
+				end
+				ancestor = ancestor.Parent
+			end
+			if target and target ~= player and eligibleGhost(target) then
+				ctx.CaptureGhost(player, target)
+				if ctx.PlayerState[target] and not ctx.PlayerState[target].Alive then
+					ctx.Remotes.Effects:FireAllClients({ kind = "Capture", position = position, playerId = player.UserId, targetId = target.UserId })
+				end
+			end
+		end
+		ctx.Broadcast()
+	end)
+
+	ctx.Remotes.Reload.OnServerEvent:Connect(function(player)
+		if not gate(player, "Reload", 0.3) or not eligibleHunter(player) then return end
+		local state = ctx.PlayerState[player]
+		local weapon = ctx.Config.Weapons.Pulse
+		if state.Ammo >= weapon.Magazine or state.ReloadUntil > now() then return end
+		local _, humanoid = livingCharacter(player)
+		if not humanoid then return end
+		local control = controlFor(player)
+		control.ReloadToken += 1
+		local token, epoch = control.ReloadToken, control.Epoch
+		state.ReloadUntil = now() + weapon.ReloadSeconds
+		ctx.Broadcast()
+		ctx.Remotes.Effects:FireClient(player, { kind = "Reload", playerId = player.UserId })
+		task.delay(weapon.ReloadSeconds, function()
+			if controls[player] ~= control or control.Epoch ~= epoch or control.ReloadToken ~= token then return end
+			if ctx.PlayerState[player] ~= state or not eligibleHunter(player) then return end
+			state.Ammo = weapon.Magazine
+			state.ReloadUntil = 0
+			ctx.Broadcast()
+		end)
+	end)
+
+	ctx.Remotes.Ability.OnServerEvent:Connect(function(player)
+		if not gate(player, "Ability", 0.3) or not eligibleGhost(player) then return end
+		local state = ctx.PlayerState[player]
+		local timestamp = now()
+		if state.AbilityReadyAt > timestamp then return end
+		local _, humanoid = livingCharacter(player)
+		if not humanoid then return end
+		local control = controlFor(player)
+		local epoch = control.Epoch
+		state.AbilityReadyAt = timestamp + ctx.Config.SprintCooldown
+		control.SprintUntil = timestamp + ctx.Config.SprintSeconds
+		humanoid.WalkSpeed = ctx.Config.SprintSpeed
+		ctx.Broadcast()
+		ctx.Remotes.Effects:FireClient(player, { kind = "Sprint", playerId = player.UserId })
+		task.delay(ctx.Config.SprintSeconds, function()
+			if controls[player] == control and control.Epoch == epoch then restoreSpeed(player) end
+		end)
+	end)
+
+	ctx.DetectorDistance = function(player)
+		if not eligibleHunter(player) then return nil end
+		local _, _, root = livingCharacter(player)
+		if not root then return nil end
+		local nearest = math.huge
+		for ghost in ctx.PlayerState do
+			if eligibleGhost(ghost) then
+				local _, _, targetRoot = livingCharacter(ghost)
+				if targetRoot then nearest = math.min(nearest, (root.Position - targetRoot.Position).Magnitude) end
+			end
+		end
+		return if nearest <= ctx.Config.DetectorRange then math.floor(nearest) else nil
+	end
+end
+
+return GameplayService
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="Script" referent="7">
+        <Properties>
+          <string name="Name">Main</string>
+          <token name="RunContext">0</token>
+          <string name="Source"><![CDATA[-- GHOST SHIFT: one server owns the match and every gameplay decision.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Teams = game:GetService("Teams")
+
+local shared = ReplicatedStorage:WaitForChild("GhostShift")
+local Config = require(shared:WaitForChild("Config"))
+local MapService = require(script.Parent:WaitForChild("MapService"))
+local GameplayService = require(script.Parent:WaitForChild("GameplayService"))
+local RoundService = require(script.Parent:WaitForChild("RoundService"))
+
+local function instance(parent, className, name)
+    local existing = parent:FindFirstChild(name)
+    if existing then
+        assert(existing:IsA(className), name .. " has an unexpected class")
+        return existing
+    end
+    local created = Instance.new(className)
+    created.Name = name
+    created.Parent = parent
+    return created
+end
+
+local remoteFolder = instance(shared, "Folder", "Remotes")
+local remotes = {}
+for _, name in { "Fire", "Reload", "ToggleDisguise", "Ability", "State", "Effects", "RequestState" } do
+    remotes[name] = instance(remoteFolder, "RemoteEvent", name)
+end
+
+local teams = {}
+for name, color in { Lobby = "Medium stone grey", Ghosts = "Royal purple", Hunters = "Cyan" } do
+    local team = instance(Teams, "Team", name)
+    team.AutoAssignable = false
+    team.TeamColor = BrickColor.new(color)
+    teams[name] = team
+end
+
+local map = MapService.Build()
+local ctx = {
+    Config = Config,
+    RoundRules = require(shared:WaitForChild("RoundRules")),
+    Remotes = remotes,
+    Teams = teams,
+    Map = map.Map,
+    Props = map.Props,
+    Spawns = map.Spawns,
+    PlayerState = {},
+    Round = { Id = 0, Phase = "Lobby", EndsAt = 0, Winner = "", Message = "Waiting for players" },
+}
+
+function ctx.Award(player, statName, amount)
+    if not player.Parent or type(amount) ~= "number" or amount <= 0 then
+        return
+    end
+    local stats = player:FindFirstChild("leaderstats")
+    local stat = stats and stats:FindFirstChild(statName)
+    if stat and stat:IsA("IntValue") then
+        stat.Value += math.floor(amount)
+    end
+end
+
+function ctx.Broadcast(onlyPlayer)
+    local ghostsAlive, huntersAlive = 0, 0
+    for _, state in ctx.PlayerState do
+        if state.Alive then
+            if state.Role == "Ghost" then
+                ghostsAlive += 1
+            elseif state.Role == "Hunter" then
+                huntersAlive += 1
+            end
+        end
+    end
+    for player, state in ctx.PlayerState do
+        if player.Parent == Players and (onlyPlayer == nil or onlyPlayer == player) then
+            local stats = player:FindFirstChild("leaderstats")
+            local coins = stats and stats:FindFirstChild("Coins")
+            local wins = stats and stats:FindFirstChild("Wins")
+            remotes.State:FireClient(player, {
+                phase = ctx.Round.Phase,
+                roundId = ctx.Round.Id,
+                endsAt = ctx.Round.EndsAt,
+                winner = ctx.Round.Winner,
+                message = ctx.Round.Message,
+                role = state.Role,
+                alive = state.Alive,
+                ammo = state.Ammo,
+                magazine = Config.Weapons.Pulse.Magazine,
+                reloadUntil = state.ReloadUntil,
+                captures = state.Captures,
+                coins = if coins then coins.Value else 0,
+                wins = if wins then wins.Value else 0,
+                ghostsAlive = ghostsAlive,
+                huntersAlive = huntersAlive,
+                disguised = state.Disguise ~= nil,
+                abilityReadyAt = state.AbilityReadyAt,
+                detectorDistance = if ctx.DetectorDistance then ctx.DetectorDistance(player) else nil,
+            })
+        end
+    end
+end
+
+GameplayService.Start(ctx)
+RoundService.Start(ctx)
+
+local requestTimes = {}
+remotes.RequestState.OnServerEvent:Connect(function(player)
+    local now = workspace:GetServerTimeNow()
+    if now - (requestTimes[player] or -math.huge) < 1 then
+        return
+    end
+    requestTimes[player] = now
+    ctx.Broadcast(player)
+end)
+
+local function onPlayerAdded(player)
+    if ctx.PlayerState[player] then
+        return
+    end
+    ctx.PlayerState[player] = {
+        Role = "Lobby",
+        Alive = false,
+        Captures = 0,
+        Ammo = Config.Weapons.Pulse.Magazine,
+        ReloadUntil = 0,
+        LastFire = -math.huge,
+        AbilityReadyAt = 0,
+        Disguise = nil,
+    }
+    local stats = instance(player, "Folder", "leaderstats")
+    for _, name in { "Coins", "Wins", "Captures" } do
+        instance(stats, "IntValue", name)
+    end
+    ctx.HandleJoiningPlayer(player)
+    local function onCharacter(character)
+        local state = ctx.PlayerState[player]
+        if not state or state.PreparingCharacter == character or state.PreparedCharacter == character then
+            return
+        end
+        state.PreparingCharacter = character
+        task.spawn(function()
+            local humanoid = character:WaitForChild("Humanoid", 10)
+            local root = character:WaitForChild("HumanoidRootPart", 10)
+            if not humanoid or not root or player.Character ~= character or not ctx.PlayerState[player] then
+                return
+            end
+            ctx.PrepareCharacter(player, character)
+            ctx.HandleCharacter(player, character)
+            if player.Character == character and ctx.PlayerState[player] == state then
+                state.PreparedCharacter = character
+                state.PreparingCharacter = nil
+            end
+        end)
+    end
+    player.CharacterAdded:Connect(onCharacter)
+    if player.Character then
+        onCharacter(player.Character)
+    end
+end
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+Players.PlayerRemoving:Connect(function(player)
+    if ctx.Eliminate then
+        ctx.Eliminate(player)
+    end
+    if ctx.CleanupPlayer then
+        ctx.CleanupPlayer(player)
+    end
+    ctx.PlayerState[player] = nil
+    requestTimes[player] = nil
+end)
+for _, player in Players:GetPlayers() do
+    onPlayerAdded(player)
+end
+
+print("[GHOST SHIFT] Station loaded. Start a Studio server with at least two clients to play.")
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="8">
+        <Properties>
+          <string name="Name">MapService</string>
+          <string name="Source"><![CDATA[-- Procedural baseline station: no external models, asset IDs, or embedded scripts.
+local Lighting = game:GetService("Lighting")
+local Workspace = game:GetService("Workspace")
+
+local MapService = {}
+
+local COLORS = {
+	Concrete = Color3.fromRGB(47, 52, 64),
+	Wall = Color3.fromRGB(36, 41, 53),
+	Metal = Color3.fromRGB(74, 85, 98),
+	Dark = Color3.fromRGB(20, 25, 34),
+	Cyan = Color3.fromRGB(77, 225, 237),
+	Violet = Color3.fromRGB(177, 124, 245),
+	Amber = Color3.fromRGB(255, 190, 94),
+	White = Color3.fromRGB(224, 232, 238),
+}
+
+local function part(parent, name, size, position, color, material)
+	local item = Instance.new("Part")
+	item.Name = name
+	item.Size = size
+	item.CFrame = CFrame.new(position)
+	item.Color = color
+	item.Material = material or Enum.Material.Concrete
+	item.Anchored = true
+	item.TopSurface = Enum.SurfaceType.Smooth
+	item.BottomSurface = Enum.SurfaceType.Smooth
+	item.Parent = parent
+	return item
+end
+
+local function sign(parent, name, position, size, text, textColor, face)
+	local board = part(parent, name, size, position, COLORS.Dark, Enum.Material.Metal)
+	local gui = Instance.new("SurfaceGui")
+	gui.Name = "StationSign"
+	gui.Face = face or Enum.NormalId.Front
+	gui.CanvasSize = Vector2.new(1200, 280)
+	gui.LightInfluence = 0
+	gui.PixelsPerStud = 50
+	gui.Parent = board
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.GothamBold
+	label.Text = text
+	label.TextColor3 = textColor or COLORS.White
+	label.TextScaled = true
+	label.TextWrapped = true
+	label.Parent = gui
+	local padding = Instance.new("UIPadding")
+	padding.PaddingLeft = UDim.new(0, 20)
+	padding.PaddingRight = UDim.new(0, 20)
+	padding.PaddingTop = UDim.new(0, 15)
+	padding.PaddingBottom = UDim.new(0, 15)
+	padding.Parent = label
+	return board
+end
+
+local function lamp(parent, name, position, color, brightness, range)
+	local fixture = part(parent, name, Vector3.new(5, 0.35, 1.4), position, color, Enum.Material.Neon)
+	fixture.CanCollide = false
+	fixture.CanTouch = false
+	local light = Instance.new("PointLight")
+	light.Color = color
+	light.Brightness = brightness
+	light.Range = range
+	light.Shadows = true
+	light.Parent = fixture
+	return fixture
+end
+
+local function prop(parent, name, kind, size, position, color, material)
+	local item = part(parent, name, size, position, color, material)
+	item:SetAttribute("GhostShiftProp", true)
+	item:SetAttribute("DisguiseKind", kind)
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.Name = "DisguisePrompt"
+	prompt.ActionText = "Possess"
+	prompt.ObjectText = kind
+	prompt.HoldDuration = 0.25
+	prompt.MaxActivationDistance = 9
+	prompt.RequiresLineOfSight = true
+	prompt.KeyboardKeyCode = Enum.KeyCode.E
+	prompt.GamepadKeyCode = Enum.KeyCode.ButtonX
+	prompt.Parent = item
+	return item
+end
+
+local function bench(parent, position, color)
+	part(parent, "BenchSeat", Vector3.new(10, 0.6, 2.8), position + Vector3.new(0, 1.8, 0), color, Enum.Material.Metal)
+	part(parent, "BenchBack", Vector3.new(10, 2.5, 0.45), position + Vector3.new(0, 3.2, 1.2), color, Enum.Material.Metal)
+	for _, x in {-3.6, 3.6} do
+		part(parent, "BenchLeg", Vector3.new(0.5, 1.7, 2.2), position + Vector3.new(x, 0.85, 0), COLORS.Metal, Enum.Material.Metal)
+	end
+end
+
+local function buildStation(model, props)
+	local architecture = Instance.new("Folder")
+	architecture.Name = "Architecture"
+	architecture.Parent = model
+	local details = Instance.new("Folder")
+	details.Name = "StationDetails"
+	details.Parent = model
+
+	-- Level floor keeps capture line-of-sight and avatar movement predictable.
+	part(architecture, "StationFloor", Vector3.new(140, 1, 100), Vector3.new(0, -0.5, 0), COLORS.Concrete)
+	part(architecture, "NorthWall", Vector3.new(140, 21, 1), Vector3.new(0, 10.5, -50), COLORS.Wall)
+	part(architecture, "SouthWall", Vector3.new(140, 21, 1), Vector3.new(0, 10.5, 50), COLORS.Wall)
+	part(architecture, "WestWall", Vector3.new(1, 21, 100), Vector3.new(-70, 10.5, 0), COLORS.Wall)
+	part(architecture, "EastWall", Vector3.new(1, 21, 100), Vector3.new(70, 10.5, 0), COLORS.Wall)
+	part(architecture, "StationRoof", Vector3.new(141, 1, 101), Vector3.new(0, 21.5, 0), COLORS.Wall)
+
+	-- The tracks are static scenery at floor level, not a damaging train system.
+	part(details, "TrackBed", Vector3.new(136, 0.08, 12), Vector3.new(0, 0.04, 30), COLORS.Dark, Enum.Material.Slate)
+	for x = -64, 64, 5 do
+		part(details, "Sleeper", Vector3.new(0.6, 0.16, 10), Vector3.new(x, 0.12, 30), Color3.fromRGB(74, 64, 57), Enum.Material.Wood)
+	end
+	for _, z in {27, 33} do
+		part(details, "Rail", Vector3.new(135, 0.25, 0.3), Vector3.new(0, 0.26, z), COLORS.Metal, Enum.Material.Metal)
+	end
+	for _, z in {22.8, 37.2} do
+		part(details, "PlatformSafetyLine", Vector3.new(134, 0.06, 0.45), Vector3.new(0, 0.05, z), COLORS.Amber, Enum.Material.Neon)
+	end
+
+	for _, x in {-48, -16, 16, 48} do
+		for _, z in {-18, 16} do
+			part(architecture, "StationPillar", Vector3.new(3, 21, 3), Vector3.new(x, 10.5, z), COLORS.Metal)
+			part(details, "PillarBand", Vector3.new(3.08, 0.28, 3.08), Vector3.new(x, 5.5, z), COLORS.Cyan, Enum.Material.Neon)
+		end
+	end
+	for _, x in {-48, -16, 16, 48} do
+		lamp(details, "HallLamp", Vector3.new(x, 18.7, -4), COLORS.Cyan, 1.7, 35)
+		lamp(details, "PlatformLamp", Vector3.new(x, 18.7, 40), COLORS.Violet, 1.2, 29)
+	end
+
+	for _, x in {-42, -10, 25} do
+		bench(details, Vector3.new(x, 0, -34), COLORS.Metal)
+	end
+	for _, x in {-40, 4, 42} do
+		bench(details, Vector3.new(x, 0, 8), Color3.fromRGB(62, 74, 82))
+	end
+	-- Cover creates several routes without sealing off either side of the hall.
+	part(details, "TicketCounter", Vector3.new(18, 4.5, 4), Vector3.new(42, 2.25, -39), COLORS.Wall)
+	part(details, "TicketCounterGlass", Vector3.new(18, 3.5, 0.2), Vector3.new(42, 6.25, -40.7), Color3.fromRGB(104, 143, 151), Enum.Material.Glass).Transparency = 0.45
+	part(details, "NoticeBoard", Vector3.new(14, 5, 0.6), Vector3.new(-43, 6, -49), COLORS.Metal, Enum.Material.Metal)
+
+	sign(details, "StationTitle", Vector3.new(0, 14, -49.25), Vector3.new(31, 4, 0.4), "GHOST SHIFT  /  LAST DEPARTURE", COLORS.Cyan, Enum.NormalId.Back)
+	sign(details, "FrozenClock", Vector3.new(0, 8.5, -49.1), Vector3.new(10, 3, 0.5), "03:17", COLORS.Amber, Enum.NormalId.Back)
+	sign(details, "PlatformSign", Vector3.new(0, 13, 48.9), Vector3.new(31, 3.5, 0.4), "PLATFORM 03  /  SERVICE SUSPENDED", COLORS.Violet)
+	sign(details, "WaitingSign", Vector3.new(-43, 6, -48.5), Vector3.new(13, 4.3, 0.2), "DO NOT FOLLOW THE LIGHTS", COLORS.White, Enum.NormalId.Back)
+
+	local crates = {
+		Vector3.new(-57, 1.5, -36), Vector3.new(-54, 1.5, -6),
+		Vector3.new(-24, 1.5, -22), Vector3.new(8, 1.5, -25),
+		Vector3.new(54, 1.5, -12), Vector3.new(30, 1.5, 42),
+	}
+	for index, position in crates do
+		prop(props, "FreightCrate" .. index, "Freight crate", Vector3.new(3, 3, 3), position, Color3.fromRGB(100, 82, 61), Enum.Material.WoodPlanks)
+	end
+	local luggage = {
+		Vector3.new(-36, 0.9, -36), Vector3.new(-7, 0.9, -32),
+		Vector3.new(28, 0.9, -30), Vector3.new(-37, 0.9, 11),
+		Vector3.new(9, 0.9, 10), Vector3.new(51, 0.9, 39),
+	}
+	for index, position in luggage do
+		prop(props, "LostLuggage" .. index, "Lost luggage", Vector3.new(2.5, 1.8, 1.5), position, index % 2 == 0 and COLORS.Violet or Color3.fromRGB(68, 94, 102), Enum.Material.Fabric)
+	end
+	for index, position in {Vector3.new(-61, 1.5, 42), Vector3.new(58, 1.5, -37), Vector3.new(22, 1.5, 2)} do
+		local bin = prop(props, "WasteBin" .. index, "Station bin", Vector3.new(2.1, 3, 2.1), position, Color3.fromRGB(61, 83, 79), Enum.Material.Metal)
+		bin.Shape = Enum.PartType.Cylinder
+		bin.Size = Vector3.new(3, 2.1, 2.1)
+		bin.CFrame = CFrame.new(position) * CFrame.Angles(0, 0, math.pi / 2)
+	end
+	prop(props, "SupplyCase", "Supply case", Vector3.new(3.5, 2.3, 2.3), Vector3.new(-4, 1.15, 43), COLORS.Metal, Enum.Material.Metal)
+
+	-- Vending machine is scenery; only deliberately modest props are possessable.
+	local vending = part(details, "VendingMachine", Vector3.new(4.5, 7, 3.5), Vector3.new(62, 3.5, -41), COLORS.Wall, Enum.Material.Metal)
+	sign(details, "VendingDisplay", vending.Position + Vector3.new(0, 1, 1.8), Vector3.new(3.4, 3.4, 0.15), "OUT\nOF\nSERVICE", COLORS.Amber, Enum.NormalId.Back)
+
+	return architecture, details
+end
+
+local function buildLobby(model)
+	local lobby = Instance.new("Folder")
+	lobby.Name = "SafeLobby"
+	lobby.Parent = model
+	local center = Vector3.new(112, 0, 0)
+	part(lobby, "LobbyFloor", Vector3.new(38, 1, 38), center + Vector3.new(0, -0.5, 0), COLORS.Concrete)
+	part(lobby, "LobbyRoof", Vector3.new(39, 1, 39), center + Vector3.new(0, 16.5, 0), COLORS.Wall)
+	for _, x in {-19, 19} do
+		part(lobby, "LobbySideWall", Vector3.new(1, 16, 38), center + Vector3.new(x, 8, 0), COLORS.Wall)
+	end
+	for _, z in {-19, 19} do
+		part(lobby, "LobbyEndWall", Vector3.new(38, 16, 1), center + Vector3.new(0, 8, z), COLORS.Wall)
+	end
+	lamp(lobby, "LobbyLight", center + Vector3.new(0, 13, 0), COLORS.Cyan, 2.4, 35)
+	sign(lobby, "LobbyTitle", center + Vector3.new(0, 11, -18.2), Vector3.new(27, 3.2, 0.3), "GHOST SHIFT  /  03:17", COLORS.Cyan, Enum.NormalId.Back)
+	sign(lobby, "LobbyInstructions", center + Vector3.new(0, 6, -18), Vector3.new(28, 5, 0.3), "WAITING ROOM\nGhosts: E possess / Q release / F sprint\nHunters: click capture / R reload", COLORS.White, Enum.NormalId.Back)
+	bench(lobby, center + Vector3.new(-9, 0, 10), COLORS.Metal)
+	bench(lobby, center + Vector3.new(5, 0, 10), COLORS.Metal)
+	return CFrame.new(center + Vector3.new(0, 4, 0))
+end
+
+function MapService.Build()
+	assert(not Workspace:FindFirstChild("GhostShiftMap"), "GhostShiftMap already exists. Build the new project in a separate place; existing map was not changed.")
+	local map = Instance.new("Model")
+	map.Name = "GhostShiftMap"
+	map:SetAttribute("GhostShiftGeneratedMap", true)
+	map.Parent = Workspace
+	local props = Instance.new("Folder")
+	props.Name = "Props"
+	props.Parent = map
+	buildStation(map, props)
+	local lobbySpawn = buildLobby(map)
+
+	Lighting.ClockTime = 3 + 17 / 60
+	Lighting.Brightness = 2
+	Lighting.Ambient = Color3.fromRGB(68, 74, 92)
+	Lighting.OutdoorAmbient = Color3.fromRGB(53, 58, 74)
+	Lighting.FogColor = Color3.fromRGB(24, 30, 45)
+	Lighting.FogStart = 130
+	Lighting.FogEnd = 330
+	Lighting.GlobalShadows = true
+	Lighting.ExposureCompensation = 0.15
+	Lighting.EnvironmentDiffuseScale = 0.45
+	Lighting.EnvironmentSpecularScale = 0.6
+	local grade = Instance.new("ColorCorrectionEffect")
+	grade.Name = "GhostShiftGrade"
+	grade.Brightness = 0.015
+	grade.Contrast = 0.09
+	grade.Saturation = -0.15
+	grade.TintColor = Color3.fromRGB(220, 232, 255)
+	grade.Parent = Lighting
+
+	return {
+		Map = map,
+		Props = props,
+		Spawns = {
+			Lobby = lobbySpawn,
+			Ghosts = {
+				CFrame.new(-56, 4, -30), CFrame.new(52, 4, 41),
+				CFrame.new(-50, 4, 41), CFrame.new(30, 4, -26),
+			},
+			Hunters = {
+				CFrame.new(52, 4, -4), CFrame.new(42, 4, -7),
+				CFrame.new(53, 4, 7), CFrame.new(35, 4, -4),
+			},
+		},
+	}
+end
+
+return MapService
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="9">
+        <Properties>
+          <string name="Name">RoundService</string>
+          <string name="Source"><![CDATA[-- Round state, team eligibility and rewards are owned by this server module.
+local Players = game:GetService("Players")
+
+local RoundService = {}
+
+function RoundService.Start(ctx)
+	local config = ctx.Config
+	local rules = ctx.RoundRules
+	assert(rules, "RoundService requires ctx.RoundRules")
+	local round = ctx.Round
+	local random = Random.new()
+	local minimumPlayers = math.max(2, config.MinPlayers)
+	local frozen = {}
+	local lastRewardedRound = -1
+
+	local function now()
+		return workspace:GetServerTimeNow()
+	end
+
+	local function isPresent(player)
+		return player.Parent == Players and ctx.PlayerState[player] ~= nil
+	end
+
+	local function humanoidOf(player)
+		local character = player.Character
+		return character and character:FindFirstChildOfClass("Humanoid")
+	end
+
+	local function teleport(player, target)
+		local character = player.Character
+		if character and character:FindFirstChild("HumanoidRootPart") then
+			character:PivotTo(target)
+			local root = character:FindFirstChild("HumanoidRootPart")
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+		end
+	end
+
+	local function unlock(player)
+		local saved = frozen[player]
+		if saved then
+			local humanoid = saved.Humanoid
+			if humanoid.Parent then
+				humanoid.WalkSpeed = saved.WalkSpeed
+				humanoid.JumpPower = saved.JumpPower
+				humanoid.JumpHeight = saved.JumpHeight
+				humanoid.AutoRotate = saved.AutoRotate
+			end
+			frozen[player] = nil
+		end
+	end
+
+	local function lock(player)
+		local humanoid = humanoidOf(player)
+		if humanoid then
+			unlock(player)
+			frozen[player] = {
+				Humanoid = humanoid,
+				WalkSpeed = humanoid.WalkSpeed,
+				JumpPower = humanoid.JumpPower,
+				JumpHeight = humanoid.JumpHeight,
+				AutoRotate = humanoid.AutoRotate,
+			}
+			humanoid.WalkSpeed = 0
+			humanoid.JumpPower = 0
+			humanoid.JumpHeight = 0
+			humanoid.AutoRotate = false
+		end
+	end
+
+	local function setTeam(player, role)
+		local key = if role == "Ghost" then "Ghosts" elseif role == "Hunter" then "Hunters" else "Lobby"
+		local team = ctx.Teams[key] or ctx.Teams[role]
+		if team then
+			player.Team = team
+			player.Neutral = false
+		end
+	end
+
+	local function readyPlayers()
+		local ready = {}
+		for player in ctx.PlayerState do
+			local humanoid = humanoidOf(player)
+			if isPresent(player) and ctx.PlayerState[player].PreparedCharacter == player.Character
+				and humanoid and humanoid.Health > 0
+				and player.Character:FindFirstChild("HumanoidRootPart") then
+				table.insert(ready, player)
+			end
+		end
+		return ready
+	end
+
+	local function resetPlayer(player, resetRole)
+		local state = ctx.PlayerState[player]
+		if not state then
+			return
+		end
+		unlock(player)
+		state.Alive = false
+		ctx.ResetPlayer(player)
+		if resetRole then
+			state.Role = "Lobby"
+			state.RoundId = nil
+		end
+		setTeam(player, "Lobby")
+		teleport(player, ctx.Spawns.Lobby)
+	end
+
+	local function phase(name, seconds, message)
+		round.Phase = name
+		round.EndsAt = if seconds > 0 then now() + seconds else 0
+		round.Message = message
+		if name ~= "Results" then
+			round.Winner = ""
+		end
+		ctx.Broadcast()
+	end
+
+	function ctx.GetAliveCounts()
+		local ghosts, hunters = 0, 0
+		for player, state in ctx.PlayerState do
+			if isPresent(player) and state.Alive and state.RoundId == round.Id then
+				if state.Role == "Ghost" then
+					ghosts += 1
+				elseif state.Role == "Hunter" then
+					hunters += 1
+				end
+			end
+		end
+		return ghosts, hunters
+	end
+
+	function ctx.Eliminate(player)
+		local state = ctx.PlayerState[player]
+		if not state or not state.Alive or state.RoundId ~= round.Id
+			or (round.Phase ~= "Hide" and round.Phase ~= "Hunt") then
+			return false
+		end
+		resetPlayer(player, false)
+		ctx.Broadcast()
+		return true
+	end
+
+	function ctx.CaptureGhost(hunter, ghost)
+		local hunterState = ctx.PlayerState[hunter]
+		local ghostState = ctx.PlayerState[ghost]
+		if round.Phase ~= "Hunt" or not isPresent(hunter) or not isPresent(ghost)
+			or not hunterState.Alive or hunterState.Role ~= "Hunter" or hunterState.RoundId ~= round.Id
+			or not ghostState.Alive or ghostState.Role ~= "Ghost" or ghostState.RoundId ~= round.Id then
+			return false
+		end
+		-- The caller must first validate its own shot/line of sight on the server.
+		if not ctx.Eliminate(ghost) then
+			return false
+		end
+		hunterState.Captures += 1
+		ctx.Award(hunter, "Captures", 1)
+		ctx.Award(hunter, "Coins", config.CaptureReward)
+		ctx.Broadcast()
+		return true
+	end
+
+	function ctx.HandleJoiningPlayer(player)
+		resetPlayer(player, true)
+		ctx.Broadcast()
+	end
+
+	function ctx.HandleCharacter(player, character)
+		-- Character resets never grant a second life in the same round.
+		if not isPresent(player) or player.Character ~= character then
+			return
+		end
+		ctx.Eliminate(player)
+		unlock(player)
+		setTeam(player, "Lobby")
+		teleport(player, ctx.Spawns.Lobby)
+		ctx.Broadcast()
+	end
+
+	local function waitCountdown(check)
+		local previousSecond = -1
+		while now() < round.EndsAt do
+			local result = check()
+			if result ~= nil then
+				return result
+			end
+			local second = math.ceil(round.EndsAt - now())
+			if second ~= previousSecond then
+				previousSecond = second
+				ctx.Broadcast()
+			end
+			task.wait(0.2)
+		end
+		return nil
+	end
+
+	local function activeWinner(expired)
+		local ghosts, hunters = ctx.GetAliveCounts()
+		return rules.getWinner(ghosts, hunters, expired)
+	end
+
+	local function assignRound(participants)
+		for index = #participants, 2, -1 do
+			local other = random:NextInteger(1, index)
+			participants[index], participants[other] = participants[other], participants[index]
+		end
+		local ghostCount = rules.chooseGhostCount(#participants)
+		for index, player in participants do
+			local state = ctx.PlayerState[player]
+			if state and isPresent(player) then
+				state.Role = if index <= ghostCount then "Ghost" else "Hunter"
+				ctx.ResetPlayer(player)
+				state.Captures = 0
+				state.Alive = true
+				state.RoundId = round.Id
+				setTeam(player, state.Role)
+				local humanoid = humanoidOf(player)
+				if humanoid then
+					humanoid.Health = humanoid.MaxHealth
+				end
+				if state.Role == "Ghost" then
+					local spawns = ctx.Spawns.Ghosts
+					teleport(player, spawns[((index - 1) % #spawns) + 1])
+				else
+					teleport(player, ctx.Spawns.Lobby)
+					lock(player)
+				end
+			end
+		end
+	end
+
+	local function releaseHunters()
+		local index = 0
+		for player, state in ctx.PlayerState do
+			if isPresent(player) and state.Alive and state.Role == "Hunter" and state.RoundId == round.Id then
+				index += 1
+				unlock(player)
+				local spawns = ctx.Spawns.Hunters
+				teleport(player, spawns[((index - 1) % #spawns) + 1])
+			end
+		end
+	end
+
+	local function finishRound(winner)
+		round.Winner = winner
+		-- No remote or death callback can award a round. This loop finishes it once.
+		if lastRewardedRound ~= round.Id then
+			lastRewardedRound = round.Id
+			for player, state in ctx.PlayerState do
+				local won = (winner == "Ghosts" and state.Role == "Ghost")
+					or (winner == "Hunters" and state.Role == "Hunter")
+				if isPresent(player) and state.RoundId == round.Id and won then
+					ctx.Award(player, "Wins", 1)
+					ctx.Award(player, "Coins", config.WinReward)
+				end
+			end
+		end
+		phase("Results", config.ResultsSeconds, if winner == "Draw" then "Round ended in a draw" else winner .. " win!")
+		for player in ctx.PlayerState do
+			resetPlayer(player, false)
+		end
+		ctx.Broadcast()
+		waitCountdown(function() return nil end)
+	end
+
+	Players.PlayerRemoving:Connect(function(player)
+		unlock(player)
+	end)
+
+	task.spawn(function()
+		while true do
+			for player in ctx.PlayerState do
+				resetPlayer(player, true)
+			end
+			phase("Lobby", 0, "Waiting for at least " .. minimumPlayers .. " players")
+			while #readyPlayers() < minimumPlayers do
+				task.wait(1)
+				ctx.Broadcast()
+			end
+
+			phase("Intermission", config.IntermissionSeconds, "A new shift starts soon")
+			local cancelled = waitCountdown(function()
+				return if #readyPlayers() < minimumPlayers then "cancel" else nil
+			end)
+			if cancelled or #readyPlayers() < minimumPlayers then
+				continue
+			end
+
+			local participants = readyPlayers()
+			round.Id += 1
+			-- Set phase before assignment so deaths/resets are always handled as live eliminations.
+			phase("Hide", config.HideSeconds, "Ghosts: hide. Hunters are held in the lobby.")
+			assignRound(participants)
+			ctx.Broadcast()
+			local winner = waitCountdown(function() return activeWinner(false) end)
+			if not winner then
+				phase("Hunt", config.HuntSeconds, "Hunters: capture every ghost before time runs out")
+				releaseHunters()
+				ctx.Broadcast()
+				winner = waitCountdown(function() return activeWinner(false) end)
+			end
+			finishRound(winner or activeWinner(true) or "Draw")
+		end
+	end)
+end
+
+return RoundService
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="StarterPlayer" referent="10">
+    <Properties>
+      <string name="Name">StarterPlayer</string>
+    </Properties>
+    <Item class="StarterPlayerScripts" referent="11">
+      <Properties>
+        <string name="Name">StarterPlayerScripts</string>
+      </Properties>
+      <Item class="Folder" referent="12">
+        <Properties>
+          <string name="Name">GhostShift</string>
+        </Properties>
+        <Item class="LocalScript" referent="13">
+          <Properties>
+            <string name="Name">Main</string>
+            <string name="Source"><![CDATA[-- GHOST SHIFT client: input, presentation and server-confirmed effects only.
+-- Hits, ammunition, cooldowns, captures and rewards are decided by the server.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+
+local player = Players.LocalPlayer
+local package = ReplicatedStorage:WaitForChild("GhostShift")
+local Config = require(package:WaitForChild("Config"))
+local remotes = package:WaitForChild("Remotes")
+local stateRemote = remotes:WaitForChild("State")
+local effectsRemote = remotes:WaitForChild("Effects")
+local fireRemote = remotes:WaitForChild("Fire")
+local reloadRemote = remotes:WaitForChild("Reload")
+local disguiseRemote = remotes:WaitForChild("ToggleDisguise")
+local abilityRemote = remotes:WaitForChild("Ability")
+local requestRemote = remotes:WaitForChild("RequestState")
+
+local colors = {
+	Background = Color3.fromRGB(12, 17, 25),
+	Panel = Color3.fromRGB(18, 27, 37),
+	Text = Color3.fromRGB(232, 240, 246),
+	Muted = Color3.fromRGB(145, 163, 180),
+	Hunter = Color3.fromRGB(80, 224, 235),
+	Ghost = Color3.fromRGB(189, 146, 255),
+	Amber = Color3.fromRGB(255, 192, 91),
+}
+
+local function create(className, properties, parent)
+	local instance = Instance.new(className)
+	for property, value in pairs(properties) do
+		instance[property] = value
+	end
+	instance.Parent = parent
+	return instance
+end
+
+local function roundCorners(instance, radius)
+	create("UICorner", { CornerRadius = UDim.new(0, radius or 10) }, instance)
+end
+
+local function outline(instance, color, transparency)
+	return create("UIStroke", {
+		Color = color or colors.Muted,
+		Transparency = transparency or 0.65,
+		Thickness = 1,
+	}, instance)
+end
+
+local screen = create("ScreenGui", {
+	Name = "GhostShiftHUD",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = false,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, player:WaitForChild("PlayerGui"))
+
+local root = create("Frame", {
+	Name = "Root",
+	Size = UDim2.fromScale(1, 1),
+	BackgroundTransparency = 1,
+}, screen)
+
+local function text(parent, name, content, position, size, fontSize, color)
+	return create("TextLabel", {
+		Name = name,
+		Text = content,
+		Position = position,
+		Size = size,
+		BackgroundTransparency = 1,
+		TextColor3 = color or colors.Text,
+		TextSize = fontSize,
+		Font = Enum.Font.GothamMedium,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Center,
+		TextWrapped = true,
+	}, parent)
+end
+
+local brand = create("Frame", {
+	Name = "StationIdentity",
+	Position = UDim2.fromOffset(18, 12),
+	Size = UDim2.fromOffset(240, 72),
+	BackgroundColor3 = colors.Background,
+	BackgroundTransparency = 0.1,
+}, root)
+roundCorners(brand)
+outline(brand, colors.Amber)
+text(brand, "Title", "GHOST SHIFT", UDim2.fromOffset(14, 6), UDim2.fromOffset(160, 28), 20)
+text(brand, "Station", "NIGHT SERVICE // ABANDONED", UDim2.fromOffset(14, 38), UDim2.fromOffset(210, 21), 10, colors.Muted)
+local clock = text(brand, "Clock", "03:17", UDim2.fromOffset(170, 9), UDim2.fromOffset(58, 24), 18, colors.Amber)
+clock.TextXAlignment = Enum.TextXAlignment.Right
+
+local phasePanel = create("Frame", {
+	Name = "RoundStatus",
+	AnchorPoint = Vector2.new(0.5, 0),
+	Position = UDim2.new(0.5, 0, 0, 12),
+	Size = UDim2.fromOffset(380, 104),
+	BackgroundColor3 = colors.Background,
+	BackgroundTransparency = 0.1,
+}, root)
+roundCorners(phasePanel)
+outline(phasePanel, colors.Amber)
+local phaseLabel = text(phasePanel, "Phase", "WAITING FOR SIGNAL", UDim2.fromOffset(14, 8), UDim2.new(1, -104, 0, 24), 15, colors.Amber)
+local timerLabel = text(phasePanel, "Timer", "--:--", UDim2.new(1, -91, 0, 8), UDim2.fromOffset(77, 26), 23)
+timerLabel.TextXAlignment = Enum.TextXAlignment.Right
+local messageLabel = text(phasePanel, "Message", "Connecting to the station…", UDim2.fromOffset(14, 39), UDim2.new(1, -28, 0, 33), 12, colors.Text)
+local remainingLabel = text(phasePanel, "Remaining", "GHOSTS  —     HUNTERS  —", UDim2.fromOffset(14, 76), UDim2.new(1, -28, 0, 18), 10, colors.Muted)
+
+local statusPanel = create("Frame", {
+	Name = "PlayerStatus",
+	AnchorPoint = Vector2.new(0, 1),
+	Position = UDim2.new(0, 18, 1, -18),
+	Size = UDim2.fromOffset(310, 142),
+	BackgroundColor3 = colors.Background,
+	BackgroundTransparency = 0.1,
+}, root)
+roundCorners(statusPanel)
+local roleOutline = outline(statusPanel, colors.Muted)
+local roleLabel = text(statusPanel, "Role", "LOBBY", UDim2.fromOffset(14, 8), UDim2.new(1, -28, 0, 25), 20)
+local weaponLabel = text(statusPanel, "Weapon", "Next departure: waiting for players", UDim2.fromOffset(14, 39), UDim2.new(1, -28, 0, 24), 13, colors.Muted)
+local detailLabel = text(statusPanel, "Detail", "", UDim2.fromOffset(14, 67), UDim2.new(1, -28, 0, 24), 12)
+local sessionLabel = text(statusPanel, "Session", "SESSION  |  COINS 0  |  WINS 0", UDim2.fromOffset(14, 101), UDim2.new(1, -28, 0, 20), 10, colors.Muted)
+
+local detectorPanel = create("Frame", {
+	Name = "Detector",
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -18, 0, 12),
+	Size = UDim2.fromOffset(220, 72),
+	BackgroundColor3 = colors.Background,
+	BackgroundTransparency = 0.1,
+	Visible = false,
+}, root)
+roundCorners(detectorPanel)
+outline(detectorPanel, colors.Hunter)
+text(detectorPanel, "Name", "SPECTRAL DETECTOR", UDim2.fromOffset(12, 7), UDim2.new(1, -24, 0, 18), 10, colors.Hunter)
+local detectorLabel = text(detectorPanel, "Signal", "NO SIGNAL", UDim2.fromOffset(12, 27), UDim2.new(1, -24, 0, 20), 13)
+local detectorTrack = create("Frame", {
+	Position = UDim2.fromOffset(12, 56),
+	Size = UDim2.new(1, -24, 0, 3),
+	BorderSizePixel = 0,
+	BackgroundColor3 = colors.Panel,
+}, detectorPanel)
+local detectorBar = create("Frame", {
+	Size = UDim2.fromScale(0, 1),
+	BorderSizePixel = 0,
+	BackgroundColor3 = colors.Hunter,
+}, detectorTrack)
+
+local crosshair = create("Frame", {
+	Name = "Crosshair",
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(32, 32),
+	BackgroundTransparency = 1,
+	Visible = false,
+}, root)
+for _, geometry in ipairs({ { 15, 1, 2, 8 }, { 15, 23, 2, 8 }, { 1, 15, 8, 2 }, { 23, 15, 8, 2 }, { 15, 15, 2, 2 } }) do
+	create("Frame", {
+		Position = UDim2.fromOffset(geometry[1], geometry[2]),
+		Size = UDim2.fromOffset(geometry[3], geometry[4]),
+		BackgroundColor3 = colors.Hunter,
+		BorderSizePixel = 0,
+	}, crosshair)
+end
+local hitMarker = text(root, "HitMarker", "×", UDim2.fromScale(0.5, 0.5), UDim2.fromOffset(64, 64), 48, colors.Amber)
+hitMarker.AnchorPoint = Vector2.new(0.5, 0.5)
+hitMarker.TextXAlignment = Enum.TextXAlignment.Center
+hitMarker.Visible = false
+
+local controls = create("Frame", {
+	Name = "ActionButtons",
+	AnchorPoint = Vector2.new(1, 1),
+	Position = UDim2.new(1, -18, 1, -22),
+	Size = UDim2.fromOffset(280, 126),
+	BackgroundTransparency = 1,
+}, root)
+create("UIListLayout", {
+	FillDirection = Enum.FillDirection.Vertical,
+	HorizontalAlignment = Enum.HorizontalAlignment.Right,
+	VerticalAlignment = Enum.VerticalAlignment.Bottom,
+	Padding = UDim.new(0, 7),
+}, controls)
+
+local function actionButton(name, label, order, color)
+	local button = create("TextButton", {
+		Name = name,
+		Text = label,
+		Size = UDim2.fromOffset(216, 36),
+		BackgroundColor3 = colors.Background,
+		BackgroundTransparency = 0.08,
+		TextColor3 = color,
+		TextSize = 12,
+		Font = Enum.Font.GothamBold,
+		LayoutOrder = order,
+		AutoButtonColor = true,
+		Visible = false,
+	}, controls)
+	roundCorners(button, 7)
+	outline(button, color, 0.35)
+	return button
+end
+
+local fireButton = actionButton("Shoot", "CLICK  /  CAPTURE PULSE", 1, colors.Hunter)
+local reloadButton = actionButton("Reload", "R  /  RELOAD", 2, colors.Hunter)
+local unhideButton = actionButton("Unhide", "Q  /  LEAVE DISGUISE", 3, colors.Ghost)
+local sprintButton = actionButton("Sprint", "F  /  PHASE SPRINT", 4, colors.Ghost)
+
+local state = {
+	phase = "Lobby",
+	role = "Lobby",
+	alive = false,
+	endsAt = 0,
+	reloadUntil = 0,
+	abilityReadyAt = 0,
+	ammo = 0,
+	magazine = 6,
+	disguised = false,
+}
+local originalCameraMode = player.CameraMode
+local originalMouseEnabled = UserInputService.MouseIconEnabled
+local firstPersonActive = false
+local promptCache = {}
+local lastLocalFire = 0
+local touchEnabled = UserInputService.TouchEnabled
+
+local function isActiveGhost()
+	return state.role == "Ghost" and state.alive == true and (state.phase == "Hide" or state.phase == "Hunt")
+end
+
+local function isActiveHunter()
+	return state.role == "Hunter" and state.alive == true and state.phase == "Hunt"
+end
+
+local function isDisguisePrompt(prompt)
+	local parent = prompt.Parent
+	return parent ~= nil and parent:IsA("BasePart") and parent:GetAttribute("GhostShiftProp") == true
+end
+
+local function refreshPrompts()
+	for prompt in pairs(promptCache) do
+		if prompt.Parent then
+			prompt.Enabled = isActiveGhost() and state.disguised ~= true
+		else
+			promptCache[prompt] = nil
+		end
+	end
+end
+
+local function observePrompt(instance)
+	if instance:IsA("ProximityPrompt") and isDisguisePrompt(instance) then
+		promptCache[instance] = true
+		instance.Enabled = isActiveGhost() and state.disguised ~= true
+	end
+end
+for _, instance in ipairs(workspace:GetDescendants()) do
+	observePrompt(instance)
+end
+workspace.DescendantAdded:Connect(observePrompt)
+
+local function shoot()
+	if not isActiveHunter() then
+		return
+	end
+	local now = workspace:GetServerTimeNow()
+	if (state.reloadUntil or 0) > now or (state.ammo or 0) <= 0 then
+		return
+	end
+	local interval = Config.Weapons.Pulse.FireInterval
+	if now - lastLocalFire < interval then
+		return
+	end
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	lastLocalFire = now
+	-- Only a direction is sent. The server chooses the origin and performs the raycast.
+	local viewport = camera.ViewportSize
+	local aim = camera:ViewportPointToRay(viewport.X * 0.5, viewport.Y * 0.5)
+	fireRemote:FireServer(aim.Direction)
+end
+
+local function reload()
+	if isActiveHunter() then
+		reloadRemote:FireServer()
+	end
+end
+
+local function unhide()
+	if isActiveGhost() and state.disguised == true then
+		disguiseRemote:FireServer()
+	end
+end
+
+local function sprint()
+	if isActiveGhost() and (state.abilityReadyAt or 0) <= workspace:GetServerTimeNow() then
+		abilityRemote:FireServer()
+	end
+end
+
+fireButton.Activated:Connect(shoot)
+reloadButton.Activated:Connect(reload)
+unhideButton.Activated:Connect(unhide)
+sprintButton.Activated:Connect(sprint)
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed or UserInputService:GetFocusedTextBox() then
+		return
+	end
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.KeyCode == Enum.KeyCode.ButtonR2 then
+		shoot()
+	elseif input.KeyCode == Enum.KeyCode.R or input.KeyCode == Enum.KeyCode.ButtonX then
+		reload()
+	elseif input.KeyCode == Enum.KeyCode.Q or input.KeyCode == Enum.KeyCode.ButtonB then
+		unhide()
+	elseif input.KeyCode == Enum.KeyCode.F or input.KeyCode == Enum.KeyCode.ButtonY then
+		sprint()
+	end
+end)
+
+local phaseNames = {
+	Lobby = "WAITING FOR PLAYERS",
+	Intermission = "NEXT DEPARTURE",
+	Hide = "HIDE PHASE",
+	Hunt = "THE HUNT IS LIVE",
+	Results = "SHIFT COMPLETE",
+}
+
+local function updateState()
+	local ghost = isActiveGhost()
+	local hunter = isActiveHunter()
+	local roleColor = if state.role == "Ghost" then colors.Ghost elseif state.role == "Hunter" then colors.Hunter else colors.Muted
+	phaseLabel.Text = phaseNames[state.phase] or tostring(state.phase)
+	messageLabel.Text = type(state.message) == "string" and state.message or ""
+	remainingLabel.Text = string.format("GHOSTS  %d     HUNTERS  %d     ROUND  %d", state.ghostsAlive or 0, state.huntersAlive or 0, state.roundId or 0)
+	roleLabel.Text = if state.role == "Ghost" then "GHOST" elseif state.role == "Hunter" then "HUNTER" else "LOBBY / SPECTATOR"
+	roleLabel.TextColor3 = roleColor
+	roleOutline.Color = roleColor
+	sessionLabel.Text = string.format("SESSION ONLY  |  COINS %d  |  WINS %d", state.coins or 0, state.wins or 0)
+	crosshair.Visible = hunter
+	detectorPanel.Visible = hunter
+	fireButton.Visible = hunter
+	reloadButton.Visible = hunter
+	unhideButton.Visible = ghost and state.disguised == true
+	sprintButton.Visible = ghost
+	if hunter ~= firstPersonActive then
+		firstPersonActive = hunter
+		player.CameraMode = if hunter then Enum.CameraMode.LockFirstPerson else originalCameraMode
+		UserInputService.MouseIconEnabled = if hunter then false else originalMouseEnabled
+	end
+	if state.role == "Hunter" then
+		detailLabel.Text = string.format("CAPTURES %d   |   %s", state.captures or 0, if hunter then "Keep your aim steady." else "Wait for the hide phase to end.")
+	elseif ghost then
+		weaponLabel.Text = if state.disguised then "DISGUISED  /  Keep moving to escape" else "Find a prop and press E to disguise"
+		detailLabel.Text = "Hunters track your spectral signal."
+	else
+		weaponLabel.Text = "You join the next available round."
+		detailLabel.Text = "Minimum 2 players. Watch the departure board."
+	end
+	local distance = state.detectorDistance
+	if type(distance) == "number" and distance == distance and distance >= 0 and distance < math.huge then
+		detectorLabel.Text = string.format("SIGNAL  /  %d STUDS", math.floor(distance + 0.5))
+		detectorBar.Size = UDim2.fromScale(math.clamp(1 - distance / (Config.DetectorRange or 90), 0.03, 1), 1)
+	else
+		detectorLabel.Text = "NO SIGNAL"
+		detectorBar.Size = UDim2.fromScale(0, 1)
+	end
+	refreshPrompts()
+end
+
+local function updateTimers()
+	local now = workspace:GetServerTimeNow()
+	local remaining = math.max(0, math.ceil((state.endsAt or 0) - now))
+	timerLabel.Text = if state.phase == "Lobby" then "--:--" else string.format("%02d:%02d", math.floor(remaining / 60), remaining % 60)
+	if state.role == "Hunter" then
+		local reloadRemaining = math.max(0, (state.reloadUntil or 0) - now)
+		if reloadRemaining > 0 then
+			weaponLabel.Text = string.format("RELOADING  %.1fs", reloadRemaining)
+		else
+			weaponLabel.Text = string.format("CAPTURE PULSE   %d / %d", state.ammo or 0, state.magazine or 6)
+		end
+	end
+	if isActiveGhost() then
+		local cooldown = math.max(0, math.ceil((state.abilityReadyAt or 0) - now))
+		sprintButton.Text = if cooldown > 0 then string.format("SPRINT READY IN  %ds", cooldown) else (if touchEnabled then "PHASE SPRINT" else "F  /  PHASE SPRINT")
+	end
+	if touchEnabled then
+		fireButton.Text = "CAPTURE PULSE"
+		reloadButton.Text = "RELOAD"
+		unhideButton.Text = "LEAVE DISGUISE"
+	end
+end
+
+local function responsiveLayout()
+	local camera = workspace.CurrentCamera
+	local width = camera and camera.ViewportSize.X or 1280
+	if camera then
+		-- The HUD respects Studio's top bar inset. Aim markers still belong to
+		-- the camera's exact viewport centre used by ViewportPointToRay.
+		local centre = camera.ViewportSize / 2 - root.AbsolutePosition
+		crosshair.Position = UDim2.fromOffset(centre.X, centre.Y)
+		hitMarker.Position = UDim2.fromOffset(centre.X, centre.Y)
+	end
+	local compact = width < 900
+	brand.Visible = not compact
+	detectorPanel.Position = if compact then UDim2.new(1, -12, 0, 126) else UDim2.new(1, -18, 0, 12)
+	detectorPanel.Size = UDim2.fromOffset(if compact then 185 else 220, 72)
+	phasePanel.Size = UDim2.fromOffset(math.min(380, width - 24), 104)
+	statusPanel.Position = UDim2.new(0, 12, 1, -12)
+	statusPanel.Size = UDim2.fromOffset(if width < 650 then 245 else 310, 142)
+	controls.Position = UDim2.new(1, -12, 1, if width < 650 then -170 else -18)
+	for _, button in ipairs({ fireButton, reloadButton, unhideButton, sprintButton }) do
+		button.Size = UDim2.fromOffset(if compact then 180 else 216, if touchEnabled then 43 else 36)
+	end
+end
+
+local function finiteVector(value)
+	return typeof(value) == "Vector3"
+		and value.X == value.X and value.Y == value.Y and value.Z == value.Z
+		and math.abs(value.X) < 1e6 and math.abs(value.Y) < 1e6 and math.abs(value.Z) < 1e6
+end
+
+local function effectPart(name, position, size, color)
+	return create("Part", {
+		Name = name,
+		Anchored = true,
+		CanCollide = false,
+		CanTouch = false,
+		CanQuery = false,
+		CastShadow = false,
+		Material = Enum.Material.Neon,
+		Color = color,
+		Size = size,
+		Position = position,
+	}, workspace)
+end
+
+effectsRemote.OnClientEvent:Connect(function(effect)
+	if type(effect) ~= "table" then
+		return
+	end
+	if effect.kind == "Shot" and finiteVector(effect.origin) and finiteVector(effect.position) then
+		local distance = (effect.position - effect.origin).Magnitude
+		if distance <= 0.01 or distance > 1000 then
+			return
+		end
+		local beam = effectPart("GhostShiftPulse", (effect.origin + effect.position) / 2, Vector3.new(0.07, 0.07, distance), colors.Hunter)
+		beam.CFrame = CFrame.lookAt((effect.origin + effect.position) / 2, effect.position)
+		TweenService:Create(beam, TweenInfo.new(0.14), { Transparency = 1 }):Play()
+		Debris:AddItem(beam, 0.2)
+		local spark = effectPart("GhostShiftImpact", effect.position, Vector3.new(0.28, 0.28, 0.28), colors.Hunter)
+		spark.Shape = Enum.PartType.Ball
+		TweenService:Create(spark, TweenInfo.new(0.18), { Size = Vector3.new(1.1, 1.1, 1.1), Transparency = 1 }):Play()
+		Debris:AddItem(spark, 0.22)
+	elseif effect.kind == "Capture" and finiteVector(effect.position) then
+		local burst = effectPart("GhostShiftCapture", effect.position, Vector3.new(1, 1, 1), colors.Ghost)
+		burst.Shape = Enum.PartType.Ball
+		burst.Transparency = 0.25
+		TweenService:Create(burst, TweenInfo.new(0.5), { Size = Vector3.new(7, 7, 7), Transparency = 1 }):Play()
+		Debris:AddItem(burst, 0.6)
+		if effect.playerId == player.UserId then
+			hitMarker.Visible = true
+			task.delay(0.22, function()
+				hitMarker.Visible = false
+			end)
+		end
+	end
+end)
+
+stateRemote.OnClientEvent:Connect(function(snapshot)
+	if type(snapshot) ~= "table" then
+		return
+	end
+	state = snapshot
+	updateState()
+	updateTimers()
+end)
+
+local uiElapsed = 0
+RunService.Heartbeat:Connect(function(delta)
+	uiElapsed += delta
+	if uiElapsed >= 0.1 then
+		uiElapsed = 0
+		updateTimers()
+		responsiveLayout()
+	end
+end)
+
+player.CharacterAdded:Connect(function()
+	requestRemote:FireServer()
+end)
+updateState()
+updateTimers()
+responsiveLayout()
+requestRemote:FireServer()
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+    </Item>
+  </Item>
+</roblox>
