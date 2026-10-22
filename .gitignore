@@ -8,7 +8,11 @@
 
 # Local tooling and generated files.
 /.tools/
-/build/
+/build/*
+!/build/GHOST-SHIFT.rbxlx
+!/build/GHOST-SHIFT-source.zip
+!/build/SHA256SUMS.txt
+!/build/README.md
 __pycache__/
 *.py[cod]
 .DS_Store

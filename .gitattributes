@@ -1,0 +1,2 @@
+# Preserve the downloadable place bytes and its SHA-256 on Windows checkouts.
+/build/GHOST-SHIFT.rbxlx -text
