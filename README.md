@@ -19,6 +19,7 @@ Roblox Studio كيحتاج Windows أو macOS. هاد بيئة Linux ما شغل
 نجاح بناء الملف وفحص الكود ماشي تأكيد أن تجربة اللعب نجحات.
 
 - [Roblox + Rojo على الحاسوب ديالك](docs/STUDIO_MIGRATION.ar-MA.md)
+- [ربط Codex على Windows مباشرة بـStudio عبر MCP](docs/CONNECT_STUDIO.ar-MA.md)
 - [المراحل ومعايير النجاح](docs/DEVELOPMENT_PLAN.ar-MA.md)
 
 `build/GHOST-SHIFT-source.zip` كيجمع الملفات ونسخة اللعبة. فك الضغط فالحاسوب باش تخدم محلياً.
